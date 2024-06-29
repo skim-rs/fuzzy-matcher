@@ -827,6 +827,24 @@ impl SkimMatcherV2 {
             return Some((0, Vec::new()));
         }
 
+        let res = self.fuzzy_inner(choice, pattern, with_pos);
+
+        if !self.use_cache {
+            // drop the allocated memory
+            self.m_cache.get().map(|cell| cell.replace(vec![]));
+            self.c_cache.get().map(|cell| cell.replace(vec![]));
+            self.p_cache.get().map(|cell| cell.replace(vec![]));
+        }
+
+        res
+    }
+
+    fn fuzzy_inner(
+        &self,
+        choice: &str,
+        pattern: &str,
+        with_pos: bool,
+    ) -> Option<(ScoreType, Vec<IndexType>)> {
         let case_sensitive = match self.case {
             CaseMatching::Respect => true,
             CaseMatching::Ignore => false,
@@ -865,78 +883,33 @@ impl SkimMatcherV2 {
         let num_char_pattern = pattern_chars.len();
         let rows = if compressed { 2 } else { num_char_pattern + 1 };
 
-        if self.element_limit > 0 && self.element_limit < rows * cols {
-            return self.simple_match(
+        let res = if self.element_limit > 0 && self.element_limit < rows * cols {
+            self.simple_match(
                 &choice_chars,
                 &pattern_chars,
                 &first_match_indices,
                 case_sensitive,
                 with_pos,
-            );
-        }
-
-        let mut m = ScoreMatrix::new(&mut m, rows, cols);
-        self.build_score_matrix(
-            &mut m,
-            &choice_chars,
-            &pattern_chars,
-            &first_match_indices,
-            compressed,
-            case_sensitive,
-        );
-        let first_col_of_last_row = first_match_indices[first_match_indices.len() - 1];
-        let last_row = m.get_row(self.adjust_row_idx(num_char_pattern, compressed));
-        let (pat_idx, &MatrixCell { m_score, .. }) = last_row[first_col_of_last_row..]
-            .iter()
-            .enumerate()
-            .max_by_key(|&(_, x)| x.m_score)
-            .map(|(idx, cell)| (idx + first_col_of_last_row, cell))
-            .expect("fuzzy_matcher failed to iterate over last_row");
-
-        let mut positions = if with_pos {
-            Vec::with_capacity(num_char_pattern)
+            )
         } else {
-            Vec::new()
+            self.sophisticated_match(
+                &mut m,
+                rows,
+                cols,
+                &choice_chars,
+                &pattern_chars,
+                compressed,
+                &first_match_indices,
+                case_sensitive,
+                with_pos,
+            )
         };
-        if with_pos {
-            let mut i = m.rows - 1;
-            let mut j = pat_idx;
-            let mut track_m = true;
-            let mut current_move = Match;
-            let first_col_first_row = first_match_indices[0];
-            while i > 0 && j > first_col_first_row {
-                if current_move == Match {
-                    positions.push((j - 1) as IndexType);
-                }
-
-                let cell = &m[(i, j)];
-                current_move = if track_m { cell.m_move } else { cell.p_move };
-                if track_m {
-                    i -= 1;
-                }
-
-                j -= 1;
-
-                track_m = match current_move {
-                    Match => true,
-                    Skip => false,
-                };
-            }
-            positions.reverse();
-        }
 
         if self.debug {
             println!("Matrix:\n{:?}", m);
         }
 
-        if !self.use_cache {
-            // drop the allocated memory
-            self.m_cache.get().map(|cell| cell.replace(vec![]));
-            self.c_cache.get().map(|cell| cell.replace(vec![]));
-            self.p_cache.get().map(|cell| cell.replace(vec![]));
-        }
-
-        Some((m_score as ScoreType, positions))
+        res
     }
 
     pub fn simple_match(
@@ -986,6 +959,71 @@ impl SkimMatcherV2 {
             case_sensitive,
             with_pos,
         ))
+    }
+
+    fn sophisticated_match(
+        &self,
+        matrix: &mut Vec<MatrixCell>,
+        rows: usize,
+        cols: usize,
+        choice: &[char],
+        pattern: &[char],
+        compressed: bool,
+        first_match_indices: &[usize],
+        case_sensitive: bool,
+        with_pos: bool,
+    ) -> Option<(ScoreType, Vec<IndexType>)> {
+        let mut m = ScoreMatrix::new(matrix, rows, cols);
+        self.build_score_matrix(
+            &mut m,
+            &choice,
+            &pattern,
+            &first_match_indices,
+            compressed,
+            case_sensitive,
+        );
+        let first_col_of_last_row = first_match_indices[first_match_indices.len() - 1];
+        let last_row = m.get_row(self.adjust_row_idx(pattern.len(), compressed));
+        let (pat_idx, &MatrixCell { m_score, .. }) = last_row[first_col_of_last_row..]
+            .iter()
+            .enumerate()
+            .max_by_key(|&(_, x)| x.m_score)
+            .map(|(idx, cell)| (idx + first_col_of_last_row, cell))
+            .expect("fuzzy_matcher failed to iterate over last_row");
+
+        let mut positions = if with_pos {
+            Vec::with_capacity(pattern.len())
+        } else {
+            Vec::new()
+        };
+        if with_pos {
+            let mut i = m.rows - 1;
+            let mut j = pat_idx;
+            let mut track_m = true;
+            let mut current_move = Match;
+            let first_col_first_row = first_match_indices[0];
+            while i > 0 && j > first_col_first_row {
+                if current_move == Match {
+                    positions.push((j - 1) as IndexType);
+                }
+
+                let cell = &m[(i, j)];
+                current_move = if track_m { cell.m_move } else { cell.p_move };
+                if track_m {
+                    i -= 1;
+                }
+
+                j -= 1;
+
+                track_m = match current_move {
+                    Match => true,
+                    Skip => false,
+                };
+            }
+            positions.reverse();
+        }
+
+        Some((m_score as ScoreType, positions))
     }
 
     fn calculate_score_with_pos(
@@ -1273,7 +1311,7 @@ mod tests {
         assert_order(&matcher, "ast", &["ast", "AST", "INT_FAST16_MAX"]);
         assert_order(&matcher, "int", &["int", "INT", "PRINT"]);
     }
-    
+
     #[test]
     fn test_reuse_should_not_affect_indices() {
         let matcher = SkimMatcherV2::default();
